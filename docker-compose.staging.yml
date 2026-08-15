@@ -1,0 +1,31 @@
+# staging profile：Nginx 三前端 + 对外 URL
+
+services:
+  mysql:
+    ports:
+      - "3307:3306"
+
+  redis:
+    ports:
+      - "6380:6379"
+
+  api:
+    ports:
+      - "${DOCKER_API_PORT:-9018}:8000"
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:9010}
+      H5_PUBLIC_BASE_URL: ${H5_PUBLIC_BASE_URL:-http://localhost:9011}
+
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile.staging
+    profiles: [staging]
+    restart: unless-stopped
+    ports:
+      - "${STAGING_PORT_ADMIN:-9010}:8080"
+      - "${STAGING_PORT_H5:-9011}:8081"
+      - "${STAGING_PORT_REGISTER:-9012}:8082"
+    depends_on:
+      api:
+        condition: service_started

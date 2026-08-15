@@ -1,0 +1,103 @@
+# LightMes Docker Compose — 基础服务
+name: lightmes
+# dev:    docker compose --profile dev -f docker-compose.yml -f docker-compose.dev.yml up -d
+# staging: docker compose --profile staging -f docker-compose.yml -f docker-compose.staging.yml up -d --build
+# 可选：cp .env.docker.example .env.docker 后改用 --env-file .env.docker 覆盖默认配置
+
+services:
+  mysql:
+    image: mysql:5.7
+    profiles: [dev, staging]
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-lightmes_root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-lightmes}
+      MYSQL_USER: ${MYSQL_USER:-lightmes}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-lightmes}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - lightmes_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    profiles: [dev, staging]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    profiles: [dev, staging]
+    restart: unless-stopped
+    env_file:
+      - .env.docker.example
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+    volumes:
+      - ./backend/data/storage:/app/data/storage
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    profiles: [dev, staging]
+    restart: unless-stopped
+    env_file:
+      - .env.docker.example
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      SKIP_MIGRATE: "1"
+    command: ["celery", "-A", "app.celery_app", "worker", "-l", "info"]
+    volumes:
+      - ./backend/data/storage:/app/data/storage
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    profiles: [dev, staging]
+    restart: unless-stopped
+    env_file:
+      - .env.docker.example
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      SKIP_MIGRATE: "1"
+    command: ["celery", "-A", "app.celery_app", "beat", "-l", "info"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+volumes:
+  lightmes_mysql_data:

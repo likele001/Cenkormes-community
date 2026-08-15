@@ -1,0 +1,23 @@
+{
+  "name": "lightmes",
+  "version": "1.0.0",
+  "description": "为中小型加工厂打造的轻量化、可快速交付的生产管理系统。",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/likele001/lightmes.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/likele001/lightmes/issues"
+  },
+  "homepage": "https://github.com/likele001/lightmes#readme"
+}

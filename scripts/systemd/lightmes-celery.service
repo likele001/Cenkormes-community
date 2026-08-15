@@ -1,0 +1,16 @@
+[Unit]
+Description=LightMes Celery Worker
+After=network.target redis.service
+PartOf=lightmes-celery.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/www/wwwroot/lightmes/backend
+Environment=PYTHONPATH=/www/wwwroot/lightmes/backend
+ExecStart=/www/server/pyporject_evn/lightmes/bin/celery -A app.celery_app worker -l info -Q celery -n lightmes_worker@%%h
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

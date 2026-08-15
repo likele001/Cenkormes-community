@@ -1,0 +1,15 @@
+[Unit]
+Description=LightMes Celery Beat Scheduler
+After=network.target redis.service lightmes-celery.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/www/wwwroot/lightmes/backend
+Environment=PYTHONPATH=/www/wwwroot/lightmes/backend
+ExecStart=/www/server/pyporject_evn/lightmes/bin/celery -A app.celery_app beat -l info -S app.schedulers.database:DatabaseScheduler
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+# dev profile 覆盖：API 热重载、端口映射、源码挂载
+
+services:
+  mysql:
+    ports:
+      - "3307:3306"
+
+  redis:
+    ports:
+      - "6380:6379"
+
+  api:
+    ports:
+      - "${DOCKER_API_PORT:-9018}:8000"
+    volumes:
+      - ./backend:/app
+      - ./backend/data/storage:/app/data/storage
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+  celery-worker:
+    volumes:
+      - ./backend:/app
+      - ./backend/data/storage:/app/data/storage
+
+  celery-beat:
+    volumes:
+      - ./backend:/app

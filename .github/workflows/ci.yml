@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────
+  # 1. 后端 pytest（SQLite 内存库，无需 MySQL）
+  # ──────────────────────────────────────────
+  backend-test:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run pytest
+        working-directory: backend
+        run: |
+          python -m pytest tests/ -v --tb=short -x \
+            --ignore=tests/test_ai_platform.py \
+            --ignore=tests/test_ai_m2.py \
+            --cov=app --cov-report=term-missing --cov-report=xml:coverage.xml
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+
+  # ──────────────────────────────────────────
+  # 2. 前端构建检查（TypeScript + Vite build）
+  # ──────────────────────────────────────────
+  frontend-build:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        project: [frontend-admin-pro, frontend-h5]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ${{ matrix.project }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.project }}
+        run: npm ci
+
+      - name: TypeScript check
+        working-directory: ${{ matrix.project }}
+        run: npm run check
+
+      - name: Build
+        working-directory: ${{ matrix.project }}
+        run: npm run build
+
+  # ──────────────────────────────────────────
+  # 3. Docker 镜像构建（仅 push 时，PR 跳过）
+  # ──────────────────────────────────────────
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'push'
+    needs: [backend-test, frontend-build]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: false
+          load: true
+          tags: lightmes-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          docker run --rm \
+            -e SKIP_DB_WAIT=1 \
+            -e SKIP_MIGRATE=1 \
+            -e APP_ENV=test \
+            -e JWT_SECRET=ci-test-secret \
+            -e DB_DSN=sqlite:///test.db \
+            lightmes-api:${{ github.sha }} \
+            python -c "from app.main import app; print('App loaded, routes:', len(app.routes))"
