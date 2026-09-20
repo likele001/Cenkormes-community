@@ -20,7 +20,7 @@
         </div>
         <div class="text-right shrink-0 hidden sm:block">
           <div class="text-xs text-gray-400">{{ t('system.about.buildInfo') }}</div>
-          <div class="text-sm text-gray-600 mt-0.5">LightMes {{ versionInfo?.version }}</div>
+          <div class="text-sm text-gray-600 mt-0.5">CenkorMES {{ versionInfo?.version }}</div>
         </div>
       </div>
     </el-card>

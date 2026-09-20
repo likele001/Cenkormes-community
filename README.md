@@ -1,6 +1,8 @@
-# LightMes Community
+# CenkorMES 社区版（开源）
 
-面向中小型加工厂的轻量化生产管理：**扫码报工 + 派工 + 两级审核**。
+CenkorMES 云端 SaaS 的开源社区档：面向中小型加工厂的轻量化生产管理，**扫码报工 + 派工 + 两级审核**。
+
+> 品牌说明：社区版与云端 SaaS 版同属 CenkorMES 产品线。仓库名 `Cenkormes-community` 为历史命名，保留不变。
 
 ## 模块
 
@@ -21,7 +23,7 @@ cd ../frontend-admin-pro && npm install && npm run dev
 
 ## 商业版
 
-完整算薪、CRM、财务等能力请使用 LightMes Pro，在社区版目录执行：
+完整算薪、CRM、财务等能力请使用 CenkorMES 商业源码版（私有仓库 `lightmes-pro`），在社区版目录执行：
 
 ```bash
 bash /path/to/lightmes-pro/scripts/install.sh "$(pwd)"

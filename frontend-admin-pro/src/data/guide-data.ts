@@ -1370,7 +1370,7 @@ const guideData: GuideSection[] = [
             id: 'ch14-3',
             title: '14.3 部署与运维（开源版）',
             content: `<h3>部署与运维指南</h3>
-<p>本文档面向开源用户，说明如何从零搭建 LightMes 并保持后台服务稳定运行。</p>
+<p>本文档面向开源用户，说明如何从零搭建 CenkorMES 并保持后台服务稳定运行。</p>
 
 <h4>一、环境要求</h4>
 <table>

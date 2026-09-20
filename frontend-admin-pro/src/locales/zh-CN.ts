@@ -2497,7 +2497,7 @@ skuBatch: {
     },
     help: {
       title: '智能帮助',
-      subtitle: '基于系统文档检索（RAG），解答 LightMes 操作与部署问题。',
+      subtitle: '基于系统文档检索（RAG），解答 CenkorMES 操作与部署问题。',
       placeholder: '例如：如何配置小程序 AppID？报工审核流程是什么？',
       ask: '提问',
       answer: '回答',
@@ -2989,7 +2989,7 @@ skuBatch: {
       confirmDeleteModel: '确认删除该模型？',
     },
     login: {
-      title: 'LightMes 平台管理',
+      title: 'CenkorMES 平台管理',
       username: '账号',
       password: '密码',
       rememberMe: '记住登录（7 天内免登录）',

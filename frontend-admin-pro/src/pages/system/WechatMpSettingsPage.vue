@@ -303,7 +303,7 @@ async function onTestSend() {
     const r = await wechatMpApi.testSend({
       openid: test.value.openid,
       template_id: test.value.template_id,
-      title: 'LightMes 测试推送',
+      title: 'CenkorMES 测试推送',
       content: '这是一条来自管理后台的测试消息，验证你的模板配置是否正确。',
       page: test.value.page || form.value.default_page,
     })
