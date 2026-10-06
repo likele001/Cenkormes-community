@@ -1,0 +1,74 @@
+import { http } from '@/utils/http'
+import type { ListResp } from '@/types/api'
+
+export type ConditionRule = {
+  field: string
+  op: '>' | '>=' | '<' | '<=' | '==' | '!=' | 'in' | 'contains'
+  value: string | number | (string | number)[]
+  else_role?: string | null
+}
+
+export type ApprovalStep = {
+  id: number
+  step_order: number
+  approver_role: string
+  is_required: boolean
+  can_skip: boolean
+  label: string | null
+  sign_mode: 'single' | 'and' | 'or'
+  condition_rule: ConditionRule | null
+  assignee_ids: number[] | null
+}
+
+export type ApprovalFlowOut = {
+  id: number
+  name: string
+  biz_type: string
+  is_active: boolean
+  steps: ApprovalStep[]
+  created_at: string
+  updated_at: string
+}
+
+export const BIZ_TYPES: Record<string, string> = {
+  report: '报工审核', order: '订单审批', purchase: '采购审批',
+}
+
+export const ROLE_LABELS: Record<string, string> = {
+  leader: '班组长', qc: '质检员', manager: '经理',
+}
+
+export const SIGN_MODE_LABELS: Record<string, string> = {
+  single: '单人审批',
+  and: '会签（多人全部通过）',
+  or: '或签（任一人通过即可）',
+}
+
+const COND_OPS: Record<string, string> = {
+  '>': '>', '>=': '>=', '<': '<', '<=': '<=', '==': '=', '!=': '≠',
+  in: '∈', contains: '包含',
+}
+
+export function conditionText(c?: ConditionRule | null): string {
+  if (!c) return ''
+  const opLabel = COND_OPS[c.op] || c.op
+  const val = Array.isArray(c.value) ? c.value.join(', ') : String(c.value)
+  return `${c.field} ${opLabel} ${val}${c.else_role ? `（否则→${ROLE_LABELS[c.else_role] || c.else_role}）` : '（不满足则跳过）'}`
+}
+
+export const approvalApi = {
+  list(biz_type?: string) {
+    return http.request<ListResp<ApprovalFlowOut>>({ url: '/admin/approval', method: 'GET', params: biz_type ? { biz_type } : {} })
+  },
+  create(data: { name: string; biz_type: string; is_active?: boolean }) {
+    return http.request<{ id: number; name: string }>({ url: '/admin/approval', method: 'POST', data })
+  },
+  get(id: number) { return http.request<ApprovalFlowOut>({ url: `/admin/approval/${id}`, method: 'GET' }) },
+  update(id: number, data: { name?: string; is_active?: boolean }) {
+    return http.request<ApprovalFlowOut>({ url: `/admin/approval/${id}`, method: 'PUT', data })
+  },
+  delete(id: number) { return http.request<{ deleted: boolean }>({ url: `/admin/approval/${id}`, method: 'DELETE' }) },
+  setSteps(id: number, steps: Omit<ApprovalStep, 'id'>[]) {
+    return http.request<{ count: number }>({ url: `/admin/approval/${id}/steps`, method: 'PUT', data: { steps } })
+  },
+}

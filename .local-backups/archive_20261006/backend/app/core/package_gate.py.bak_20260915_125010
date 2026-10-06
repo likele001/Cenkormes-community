@@ -1,0 +1,98 @@
+# -*- coding: utf-8 -*-
+"""套餐授权网关：Pro 专属功能按租户套餐层级拦截（SaaS 付费墙）"""
+import logging
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from app.core.db import SessionLocal
+from app.core.response import fail
+from app.core.security import decode_token
+from app.models.saas_package import SaasPackage
+from app.models.tenant import Tenant
+
+logger = logging.getLogger("uvicorn.error")
+
+# Pro 专属路由前缀（与 scripts/pro-manifest.txt 对齐）
+PRO_ONLY_ROUTES = (
+    "/api/admin/trace",
+    "/api/admin/finance",
+    "/api/admin/warehouse",
+    "/api/admin/equipment",
+    "/api/admin/reports",
+    "/api/admin/ai",
+    "/api/admin/ai-employees",
+    "/api/admin/automation",
+    "/api/admin/purchase",
+    "/api/admin/shift",
+    "/api/admin/mrp",
+    "/api/admin/quotation",
+    "/api/admin/subcontract",
+    "/api/admin/mold",
+    "/api/admin/spc",
+    "/api/admin/approval",
+    "/api/admin/exec-dashboard",
+    "/api/admin/industry",
+    "/api/admin/production/crm",
+    "/api/admin/production/customers",
+    "/api/admin/system/feishu",
+    "/api/admin/system/wecom",
+    "/api/admin/system/dingtalk",
+    "/api/admin/system/wechat-miniapp",
+    "/api/admin/system/attendance-records",
+    "/api/admin/system/message-center",
+    "/api/admin/system/print-templates",
+    "/api/admin/system/operation-logs",
+    "/api/admin/system/skills",
+    "/api/h5/ai",
+    "/api/h5/ai-employees",
+    "/api/h5/customer",
+    "/api/h5/salary",
+    "/api/h5/attendance",
+)
+
+# 允许访问 Pro 功能的套餐层级（pro 专业版 / enterprise 企业版）
+ALLOWED_TIERS = {"pro", "enterprise"}
+
+# 免检租户白名单（一般无需配置，测试租户直接给 enterprise 套餐）
+WHITELIST_TENANT_IDS: set[int] = set()
+
+
+class PackageGateMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if not path.startswith(PRO_ONLY_ROUTES):
+            return await call_next(request)
+
+        auth = request.headers.get("authorization", "")
+        if not auth.lower().startswith("bearer "):
+            # 无 token：交给正常鉴权返回 401
+            return await call_next(request)
+
+        token = auth.split(" ", 1)[1].strip()
+        try:
+            payload = decode_token(token)
+            tenant_id = int(payload.get("tenant_id") or 0)
+        except Exception:
+            return await call_next(request)
+
+        if not tenant_id or tenant_id in WHITELIST_TENANT_IDS:
+            return await call_next(request)
+
+        tier = None
+        db = SessionLocal()
+        try:
+            tenant = db.get(Tenant, tenant_id)
+            if tenant and tenant.current_package_id:
+                pkg = db.get(SaasPackage, tenant.current_package_id)
+                tier = pkg.tier if pkg else None
+        finally:
+            db.close()
+
+        if tier not in ALLOWED_TIERS:
+            return JSONResponse(
+                status_code=200,
+                content=fail(403, "当前套餐不含此功能，请升级 Pro 专业版"),
+            )
+        return await call_next(request)

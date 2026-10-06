@@ -1,0 +1,275 @@
+# SPDX-License-Identifier: AGPL-3.0
+"""ABAC 引擎：在现有 RBAC 之上叠加行级 + 列级权限。
+
+用法（行级，装饰器——推荐，侵入最小）：
+    from app.services.abac.engine import abac_guard
+
+    @abac_guard(resource="orders")
+    def list_orders(db: Session, user: User):
+        return db.query(Order).all()
+
+    # guard 会在调用后、执行前，解析当前用户对该 resource 的数据范围，
+    # 自动对 query 追加行级过滤（如 department_id == user.department_id）。
+    # 若当前用户/角色无行级限制（scope=ALL 或未配置规则），query 原样返回（fast-path，零开销）。
+
+用法（列级，脱敏——序列化层）：
+    from app.services.abac.engine import abac, mask_row
+
+    out = abac(db, user).mask_row("salary_slips", {"net_amount": 10000})
+    # -> {"net_amount": None}（当规则要求置空时）
+
+设计要点：
+- 行级走「显式装饰器」而非全局 SQLAlchemy event，避免影响所有查询，灰度更安全。
+- 列级走序列化层，不拦截 __getattr__，无性能损耗且易测。
+- 与 RBAC 共存：RBAC 管"能不能进"，ABAC 管"进来后能看到哪几行/哪几列"。
+- 所有查询仍满足现有 tenant_id 硬约束（本项目已在 api 层统一过滤租户，ABAC 叠加在此之上）。
+"""
+from __future__ import annotations
+
+import functools
+import hashlib
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from app.models.abac import DataScope, FieldPolicy, PolicyBinding, PolicyRule
+
+_HASH_SALT = "cenkormes-abac"
+
+
+# ---------- 上下文 ----------
+
+@dataclass
+class AbacContext:
+    """一次请求的 ABAC 上下文：封装当前用户与归属信息。"""
+
+    tenant_id: int
+    user_id: int
+    department_id: Optional[int] = None
+    workshop_id: Optional[int] = None
+    role_codes: list[str] = field(default_factory=list)
+    is_superuser: bool = False
+    original_user_id: Optional[int] = None
+
+    @property
+    def is_admin(self) -> bool:
+        return self.is_superuser or self.department_id is None
+
+
+# ---------- 引擎 ----------
+
+class AbacEngine:
+    def __init__(self, db, ctx: AbacContext):
+        self.db = db
+        self.ctx = ctx
+        self._scope_types: dict[str, str] = {}
+
+    # -- 策略解析 --
+
+    def _scope_type(self, code: str) -> Optional[str]:
+        if code not in self._scope_types:
+            s = (
+                self.db.query(DataScope)
+                .filter(DataScope.tenant_id == self.ctx.tenant_id, DataScope.code == code)
+                .first()
+            )
+            self._scope_types[code] = s.scope_type if s else ""
+        return self._scope_types[code] or None
+
+    def _resolve_scope_type(self, resource: str) -> Optional[str]:
+        """解析当前用户在 resource 上的有效数据范围类型。优先用户级绑定，其次角色级绑定与规则。"""
+        if self.ctx.is_superuser:
+            return "ALL"
+        binding_codes: list[str] = []
+        rule_scopes: list[str] = []
+
+        # 用户级绑定
+        for b in self._query_bindings(("user", self.ctx.user_id), resource):
+            binding_codes.append(b.scope_code)
+        # 角色级绑定 + 规则
+        for rid in self.ctx.role_codes:
+            for b in self._query_bindings(("role", rid), resource):
+                binding_codes.append(b.scope_code)
+        for rid in self.ctx.role_codes:
+            r = self._query_rule(resource, rid)
+            if r and r.row_filter_scope:
+                rule_scopes.append(r.row_filter_scope)
+
+        for code in binding_codes:
+            st = self._scope_type(code)
+            if st:
+                if st == "ALL":
+                    return "ALL"
+                return st
+        for code in rule_scopes:
+            st = self._scope_type(code)
+            if st:
+                if st == "ALL":
+                    return "ALL"
+                return st
+        return None
+
+    def _query_bindings(self, principal, resource) -> list[PolicyBinding]:
+        ptype, pid = principal
+        return (
+            self.db.query(PolicyBinding)
+            .filter(
+                PolicyBinding.tenant_id == self.ctx.tenant_id,
+                PolicyBinding.principal_type == ptype,
+                PolicyBinding.principal_id == pid,
+                PolicyBinding.resource == resource,
+            )
+            .all()
+        )
+
+    def _query_rule(self, resource: str, role_code: str) -> Optional[PolicyRule]:
+        return (
+            self.db.query(PolicyRule)
+            .filter(
+                PolicyRule.tenant_id == self.ctx.tenant_id,
+                PolicyRule.resource == resource,
+                PolicyRule.role_code == role_code,
+                PolicyRule.is_active.is_(True),
+            )
+            .first()
+        )
+
+    # -- 行级 --
+
+    def apply_row(self, query, resource=None):
+        """给已构造的 query 附加行级过滤，返回新 query（不修改原对象）。
+
+        resource 显式传入（推荐），缺省时回退到 query._abac_resource（兼容装饰器旧用法）。
+        """
+        if resource is None:
+            resource = getattr(query, "_abac_resource", None)
+        if not resource:
+            return query
+        scope_type = self._resolve_scope_type(resource)
+        if scope_type in ("ALL", None):
+            return query  # fast-path：无限制
+        model = self._entity(query)
+        col = self._pick_column(model, resource, scope_type)
+        if col is None:
+            return query
+        return query.filter(col)
+
+    def _entity(self, query):
+        try:
+            ent = query.column_descriptions
+            return ent[0]["type"] if ent else None
+        except Exception:
+            return None
+
+    def _pick_column(self, model, resource: str, scope_type: str):
+        if model is None:
+            return None
+        mapping = {
+            "SELF": ["created_by_id", "owner_user_id", "user_id", "report_user_id"],
+            "DEPT": ["department_id"],
+            "DEPT_SUBTREE": ["department_id"],
+            "WORKSHOP": ["workshop_id"],
+        }
+        for colname in mapping.get(scope_type, []):
+            if hasattr(model, colname):
+                attr = getattr(model, colname)
+                if scope_type == "SELF":
+                    return attr.__eq__(self.ctx.user_id)
+                if scope_type == "WORKSHOP":
+                    return attr.__eq__(self.ctx.workshop_id)
+                return attr.__eq__(self.ctx.department_id)
+        return None
+
+    # -- 列级 --
+
+    def field_mask(self, resource: str) -> dict[str, str]:
+        if self.ctx.is_superuser:
+            return {}
+        roles = self.ctx.role_codes
+        if not roles:
+            return {}
+        fps = (
+            self.db.query(FieldPolicy)
+            .filter(
+                FieldPolicy.tenant_id == self.ctx.tenant_id,
+                FieldPolicy.resource == resource,
+                FieldPolicy.is_active.is_(True),
+                FieldPolicy.role_code.in_(roles),
+            )
+            .all()
+        )
+        return {fp.field_name: fp.mask_type for fp in fps}
+
+    def mask_value(self, mask_type: str, value: Any) -> Any:
+        if value is None:
+            return None
+        s = str(value)
+        if mask_type == "NULL":
+            return None
+        if mask_type == "FULL":
+            return "*" * len(s)
+        if mask_type == "LAST4":
+            return "*" * (len(s) - 4) + s[-4:] if len(s) > 4 else "*" * len(s)
+        if mask_type == "HASH":
+            return hashlib.md5(f"{s}{_HASH_SALT}".encode()).hexdigest()[:8]
+        return value
+
+    def mask_row(self, resource: str, row: dict) -> dict:
+        masks = self.field_mask(resource)
+        if not masks:
+            return row
+        for f, mt in masks.items():
+            if f in row:
+                row[f] = self.mask_value(mt, row[f])
+        return row
+
+    def mask_rows(self, resource: str, rows: list[dict]) -> list[dict]:
+        masks = self.field_mask(resource)
+        if not masks:
+            return rows
+        for row in rows:
+            for f, mt in masks.items():
+                if f in row:
+                    row[f] = self.mask_value(mt, row[f])
+        return rows
+
+
+# ---------- 便捷入口 ----------
+
+def abac(db, user):
+    """依据一个 ORM user（含 roles/department）构造 AbacEngine。"""
+    roles = getattr(user, "roles", None) or []
+    return AbacEngine(db, AbacContext(
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        department_id=getattr(user, "department_id", None),
+        role_codes=[r.code for r in roles],
+        is_superuser=bool(getattr(user, "is_superuser", False)),
+    ))
+
+
+def abac_guard(resource: str):
+    """装饰器：对返回 SQLAlchemy Query 的函数在原样返回前自动应用行级过滤。"""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            # 参数里找 db 与 user（常见命名，兼容位置/关键字参数）
+            db = None
+            user = None
+            for a in args:
+                if hasattr(a, "query") and hasattr(a, "get_bind"):
+                    db = a
+                if hasattr(a, "id") and hasattr(a, "department_id"):
+                    user = a
+            for k, v in kwargs.items():
+                if k == "db" or (db is None and hasattr(v, "query") and hasattr(v, "get_bind")):
+                    db = v
+                if k == "user" or (user is None and hasattr(v, "id") and hasattr(v, "department_id")):
+                    user = v
+            result = fn(*args, **kwargs)
+            if db is None or user is None:
+                return result
+            setattr(result, "_abac_resource", resource) if result is not None else None
+            engine = abac(db, user)
+            return engine.apply_row(result)
+        return wrapper
+    return deco

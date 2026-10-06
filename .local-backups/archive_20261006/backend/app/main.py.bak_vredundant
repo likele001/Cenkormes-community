@@ -1,0 +1,118 @@
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+import logging
+from sqlalchemy.orm import Session
+
+from app.api.router import api_router
+from app.core.config import settings
+from app.core.db import SessionLocal, engine
+from app.core.package_gate import PackageGateMiddleware
+from app.core.errors import BizError
+from app.core.response import fail, ok
+from app.crud.rbac import ensure_default_roles_all_tenants, ensure_permissions
+from app.models.base import Base
+
+
+app = FastAPI(title=settings.APP_NAME)
+app.include_router(api_router, prefix="/api")
+app.add_middleware(PackageGateMiddleware)
+
+
+@app.get("/api/health")
+def health():
+    return ok({"status": "ok", "build": "20260525-automation"})
+
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(_: Request, exc: HTTPException):
+    return JSONResponse(status_code=200, content=fail(exc.status_code, str(exc.detail)), headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+def validation_exception_handler(_: Request, exc: RequestValidationError):
+    # 过滤 input/ctx/url 等敏感字段，避免回显用户提交的原始值（如密码）
+    errors = [{k: v for k, v in e.items() if k not in ("input", "ctx", "url")} for e in exc.errors()]
+    return JSONResponse(status_code=200, content=fail(400, "参数校验失败", {"errors": errors}))
+
+
+@app.exception_handler(BizError)
+def biz_exception_handler(_: Request, exc: BizError):
+    return JSONResponse(status_code=200, content=fail(exc.code, exc.msg))
+
+
+logger = logging.getLogger("uvicorn.error")
+
+
+@app.exception_handler(Exception)
+def any_exception_handler(_: Request, exc: Exception):
+    logger.error("未捕获异常: %s", exc, exc_info=exc)
+    if settings.APP_ENV == "dev":
+        return JSONResponse(
+            status_code=200,
+            content=fail(
+                500,
+                "服务器错误",
+                {"error": str(exc), "type": type(exc).__name__},
+            ),
+        )
+    return JSONResponse(status_code=200, content=fail(500, "服务器错误"))
+
+
+@app.on_event("startup")
+def on_startup():
+    if settings.DB_AUTO_CREATE:
+        Base.metadata.create_all(bind=engine)
+    if settings.DB_AUTO_SEED:
+        db: Session = SessionLocal()
+        try:
+            ensure_permissions(db)
+            ensure_default_roles_all_tenants(db)
+            db.commit()
+        finally:
+            db.close()
+
+    # 一次性自动迁移飞书/企微 settings 旧结构 → 新 channels 嵌套结构（幂等）
+    try:
+        from app.services.notify_migration import run_migration
+        db = SessionLocal()
+        try:
+            summary = run_migration(db)
+            logger.info("notify settings migration summary: %s", summary)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("notify_migration startup failed: %s", e)
+
+    # 系统版本表种子（幂等，从 CHANGELOG.json 同步，仅在版本号不存在时插入）
+    try:
+        from pathlib import Path
+        from app.crud.system_version import sync_changelog_from_file
+        db = SessionLocal()
+        try:
+            changelog_path = Path(__file__).resolve().parents[1] / "CHANGELOG.json"
+            added = sync_changelog_from_file(db, changelog_path)
+            if added:
+                logger.info("synced %d system versions from CHANGELOG.json", added)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("seed system versions failed: %s", e)
+
+    # 定时任务默认配置种子（幂等，仅在 cron_jobs 表为空时插入）
+    try:
+        from app.services.cron_job_seeder import seed_default_cron_jobs
+        db = SessionLocal()
+        try:
+            added = seed_default_cron_jobs(db)
+            if added:
+                logger.info("seed_default_cron_jobs: added %d jobs", added)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("seed_default_cron_jobs startup failed: %s", e)
+
+# --- 版本与更新日志（公开端点，无需登录） ---
+from app.api.public.version import router as version_router  # noqa: E402
+
+app.include_router(version_router, prefix="/api", tags=["public"])

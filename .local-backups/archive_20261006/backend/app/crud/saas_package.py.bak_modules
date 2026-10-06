@@ -1,0 +1,48 @@
+from decimal import Decimal
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.models.saas_package import SaasPackage
+
+
+def list_packages(db: Session, active_only: bool = False) -> list[SaasPackage]:
+    stmt = select(SaasPackage).order_by(SaasPackage.sort_order, SaasPackage.id)
+    if active_only:
+        stmt = stmt.where(SaasPackage.is_active.is_(True))
+    return list(db.scalars(stmt).all())
+
+
+def get_package_by_id(db: Session, package_id: int) -> SaasPackage | None:
+    return db.get(SaasPackage, package_id)
+
+
+def get_package_by_code(db: Session, code: str) -> SaasPackage | None:
+    return db.scalar(select(SaasPackage).where(SaasPackage.code == code))
+
+
+def create_package(
+    db: Session,
+    code: str,
+    name: str,
+    price_yuan: Decimal,
+    duration_days: int,
+    max_users: int,
+    features_json: str | None,
+    description: str | None,
+    sort_order: int,
+) -> SaasPackage:
+    pkg = SaasPackage(
+        code=code,
+        name=name,
+        price_yuan=price_yuan,
+        duration_days=duration_days,
+        max_users=max_users,
+        features_json=features_json,
+        description=description,
+        sort_order=sort_order,
+        is_active=True,
+    )
+    db.add(pkg)
+    db.flush()
+    return pkg

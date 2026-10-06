@@ -1,0 +1,806 @@
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+
+from app.core.deps import get_current_permissions, get_current_user, get_db, require_any_permissions
+from app.core.response import ok
+from app.crud.customer import create_customer, get_customer_by_code, get_customer_by_id, list_customers, update_customer
+from app.crud.notification import create_notification, notify_users_with_permission
+from app.crud.order import create_order, get_order_by_code
+from app.crud.crm import (
+    create_customer_contact,
+    create_opportunity,
+    create_opportunity_activity,
+    deactivate_customer_contact,
+    deactivate_opportunity,
+    get_contact_by_id,
+    get_opportunity_by_id,
+    list_customer_contacts,
+    list_customer_tag_links,
+    list_opportunities,
+    list_opportunity_activities,
+    recycle_stale_opportunities,
+    set_customer_tags,
+    update_customer_contact,
+    update_opportunity,
+)
+from app.crud.tenant_setting import get_setting
+from app.models.user import User
+from app.crud.customer_product import list_customer_product_ids, list_customer_products_with_detail, set_customer_products
+from app.crud.user import get_user_by_id
+from app.schemas.customer import CustomerCreateIn, CustomerProductsSetIn, CustomerUpdateIn
+from app.services.code_generator import BizType, resolve_code
+from app.services.customer_account import ensure_customer_login_user
+from app.schemas.crm import (
+    CrmOpportunityActivityCreateIn,
+    CrmOpportunityCreateIn,
+    CrmOpportunityUpdateIn,
+    CustomerContactCreateIn,
+    CustomerContactUpdateIn,
+    CustomerTagsSetIn,
+    OpportunityConvertToOrderIn,
+)
+from app.schemas.order import OrderItemCreateIn
+from app.services.crm_scope import (
+    apply_customer_scope,
+    apply_opportunity_scope,
+    can_access_customer,
+    can_access_opportunity,
+    crm_has_full_access,
+)
+
+
+router = APIRouter(dependencies=[Depends(require_any_permissions(["customer.manage", "crm.sales"]))])
+
+RECYCLE_DAYS_KEY = "crm.public_pool.recycle_days"
+
+
+def _recycle_days(db: Session, tenant_id: int) -> int:
+    s = get_setting(db, tenant_id=tenant_id, key=RECYCLE_DAYS_KEY)
+    if not s or not s.value:
+        return 30
+    try:
+        return int(str(s.value).strip())
+    except Exception:
+        return 30
+
+
+def _out(x, db: Session | None = None, tenant_id: int | None = None) -> dict:
+    login_username = None
+    owner_name = None
+    if x.user_id and db is not None and tenant_id is not None:
+        u = get_user_by_id(db, tenant_id=tenant_id, user_id=x.user_id)
+        if u:
+            login_username = u.username
+    if getattr(x, "owner_user_id", None) and db is not None and tenant_id is not None:
+        ou = get_user_by_id(db, tenant_id=tenant_id, user_id=x.owner_user_id)
+        if ou:
+            owner_name = ou.full_name or ou.username
+    product_count = 0
+    if db is not None and tenant_id is not None:
+        product_count = len(list_customer_product_ids(db, tenant_id, x.id))
+    return {
+        "id": x.id,
+        "tenant_id": x.tenant_id,
+        "user_id": x.user_id,
+        "owner_user_id": getattr(x, "owner_user_id", None),
+        "owner_name": owner_name,
+        "login_username": login_username,
+        "product_count": product_count,
+        "code": x.code,
+        "name": x.name,
+        "contact_name": x.contact_name,
+        "contact_phone": x.contact_phone,
+        "address": x.address,
+        "remark": x.remark,
+        "is_active": x.is_active,
+        "created_at": x.created_at,
+        "updated_at": x.updated_at,
+    }
+
+
+def _opp_out(x) -> dict:
+    return {
+        "id": x.id,
+        "tenant_id": x.tenant_id,
+        "customer_id": x.customer_id,
+        "code": x.code,
+        "title": x.title,
+        "stage": x.stage,
+        "status": x.status,
+        "amount": float(x.amount) if x.amount is not None else None,
+        "probability": x.probability,
+        "expected_close_date": str(x.expected_close_date) if x.expected_close_date else None,
+        "owner_user_id": x.owner_user_id,
+        "owner_name": x.owner.full_name if x.owner else None,
+        "converted_order_id": getattr(x, "converted_order_id", None),
+        "converted_order_code": x.converted_order.code if getattr(x, "converted_order", None) else None,
+        "remark": x.remark,
+        "is_active": x.is_active,
+        "created_at": x.created_at,
+        "updated_at": x.updated_at,
+    }
+
+
+def _customer_scope(permission_codes: list[str], user: User):
+    return lambda stmt: apply_customer_scope(stmt, user, permission_codes)
+
+
+def _opportunity_scope(permission_codes: list[str], user: User):
+    return lambda stmt: apply_opportunity_scope(stmt, user, permission_codes)
+
+
+def _need_customer(db: Session, tenant_id: int, customer_id: int, user: User, permission_codes: list[str]):
+    c = get_customer_by_id(db, tenant_id=tenant_id, customer_id=customer_id)
+    if not c:
+        raise HTTPException(status_code=400, detail="客户不存在")
+    if not can_access_customer(db, user, c, permission_codes):
+        raise HTTPException(status_code=403, detail="无权访问该客户")
+    return c
+
+
+@router.get("")
+def list_api(
+    keyword: str | None = Query(default=None),
+    owner_user_id: int | None = Query(default=None, ge=1),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    include_inactive: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    items = list_customers(
+        db,
+        tenant_id=user.tenant_id,
+        keyword=keyword,
+        owner_user_id=owner_user_id,
+        offset=offset,
+        limit=limit,
+        include_inactive=include_inactive,
+        scope_stmt=_customer_scope(permission_codes, user),
+    )
+    return ok({"items": [_out(x, db, user.tenant_id) for x in items]})
+
+
+@router.get("/{customer_id}")
+def get_api(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    item = _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    return ok(_out(item, db, user.tenant_id))
+
+
+@router.get("/{customer_id}/products")
+def list_customer_products_api(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    c = _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    products = list_customer_products_with_detail(db, tenant_id=user.tenant_id, customer_id=c.id)
+    return ok(
+        {
+            "product_ids": [p.id for p in products],
+            "items": [{"id": p.id, "code": p.code, "name": p.name, "category": p.category} for p in products],
+        }
+    )
+
+
+@router.put("/{customer_id}/products")
+def set_customer_products_api(
+    customer_id: int,
+    payload: CustomerProductsSetIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    c = _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    ids = set_customer_products(db, tenant_id=user.tenant_id, customer_id=c.id, product_ids=payload.product_ids)
+    db.commit()
+    return ok({"customer_id": c.id, "product_ids": ids})
+
+
+@router.post("")
+def create_api(
+    payload: CustomerCreateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    customer_code = resolve_code(
+        db,
+        tenant_id=user.tenant_id,
+        biz_type=BizType.CUSTOMER,
+        code=payload.code,
+        exists=lambda c: get_customer_by_code(db, user.tenant_id, c) is not None,
+        duplicate_msg="客户编码已存在",
+    )
+    owner_user_id = payload.owner_user_id
+    if owner_user_id is None and not crm_has_full_access(user, permission_codes):
+        owner_user_id = user.id
+    if owner_user_id is not None:
+        ou = get_user_by_id(db, tenant_id=user.tenant_id, user_id=owner_user_id)
+        if not ou:
+            raise HTTPException(status_code=400, detail="负责人不存在")
+    item = create_customer(
+        db,
+        tenant_id=user.tenant_id,
+        code=customer_code,
+        name=payload.name,
+        user_id=None,
+        contact_name=payload.contact_name,
+        contact_phone=payload.contact_phone,
+        address=payload.address,
+        remark=payload.remark,
+        is_active=payload.is_active,
+        owner_user_id=owner_user_id,
+    )
+    ensure_customer_login_user(
+        db,
+        user.tenant_id,
+        item,
+        user_id=payload.user_id,
+        login_username=payload.login_username,
+        login_password=payload.login_password,
+    )
+    db.commit()
+    return ok(_out(item, db, user.tenant_id))
+
+
+@router.put("/{customer_id}")
+def update_api(
+    customer_id: int,
+    payload: CustomerUpdateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    item = _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    if payload.code is not None and payload.code != item.code:
+        exists = get_customer_by_code(db, tenant_id=user.tenant_id, code=payload.code)
+        if exists:
+            raise HTTPException(status_code=400, detail="客户编码已存在")
+    update_customer(
+        db,
+        item=item,
+        code=payload.code,
+        name=payload.name,
+        user_id=item.user_id,
+        contact_name=payload.contact_name,
+        contact_phone=payload.contact_phone,
+        address=payload.address,
+        remark=payload.remark,
+        is_active=payload.is_active,
+        owner_user_id=payload.owner_user_id,
+    )
+    if payload.user_id is not None or payload.login_username or payload.login_password:
+        ensure_customer_login_user(
+            db,
+            user.tenant_id,
+            item,
+            user_id=payload.user_id,
+            login_username=payload.login_username,
+            login_password=payload.login_password,
+        )
+    db.commit()
+    return ok(_out(item, db, user.tenant_id))
+
+
+@router.get("/{customer_id}/contacts")
+def list_contacts_api(
+    customer_id: int,
+    include_inactive: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    items = list_customer_contacts(db, tenant_id=user.tenant_id, customer_id=customer_id, include_inactive=include_inactive)
+    return ok(
+        {
+            "items": [
+                {
+                    "id": x.id,
+                    "tenant_id": x.tenant_id,
+                    "customer_id": x.customer_id,
+                    "name": x.name,
+                    "phone": x.phone,
+                    "email": x.email,
+                    "title": x.title,
+                    "is_primary": x.is_primary,
+                    "remark": x.remark,
+                    "is_active": x.is_active,
+                    "created_at": x.created_at,
+                    "updated_at": x.updated_at,
+                }
+                for x in items
+            ]
+        }
+    )
+
+
+@router.post("/{customer_id}/contacts")
+def create_contact_api(
+    customer_id: int,
+    payload: CustomerContactCreateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    item = create_customer_contact(
+        db,
+        tenant_id=user.tenant_id,
+        customer_id=customer_id,
+        name=payload.name,
+        phone=payload.phone,
+        email=payload.email,
+        title=payload.title,
+        is_primary=payload.is_primary,
+        remark=payload.remark,
+        is_active=payload.is_active,
+    )
+    db.commit()
+    return ok({"id": item.id})
+
+
+@router.put("/{customer_id}/contacts/{contact_id}")
+def update_contact_api(
+    customer_id: int,
+    contact_id: int,
+    payload: CustomerContactUpdateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    item = get_contact_by_id(db, tenant_id=user.tenant_id, contact_id=contact_id)
+    if not item or item.customer_id != customer_id:
+        raise HTTPException(status_code=400, detail="联系人不存在")
+    update_customer_contact(
+        db,
+        item,
+        name=payload.name,
+        phone=payload.phone,
+        email=payload.email,
+        title=payload.title,
+        is_primary=payload.is_primary,
+        remark=payload.remark,
+        is_active=payload.is_active,
+    )
+    db.commit()
+    return ok({"id": item.id})
+
+
+@router.delete("/{customer_id}/contacts/{contact_id}")
+def delete_contact_api(
+    customer_id: int,
+    contact_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    item = get_contact_by_id(db, tenant_id=user.tenant_id, contact_id=contact_id)
+    if not item or item.customer_id != customer_id:
+        raise HTTPException(status_code=400, detail="联系人不存在")
+    deactivate_customer_contact(db, item)
+    db.commit()
+    return ok({"id": item.id})
+
+
+@router.get("/{customer_id}/opportunities")
+def list_opportunities_api(
+    customer_id: int,
+    status: str | None = Query(default=None),
+    include_inactive: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    recycled = recycle_stale_opportunities(db, tenant_id=user.tenant_id, days=_recycle_days(db, user.tenant_id))
+    if recycled:
+        db.commit()
+    items = list_opportunities(
+        db,
+        tenant_id=user.tenant_id,
+        customer_id=customer_id,
+        status=status,
+        include_inactive=include_inactive,
+        scope_stmt=_opportunity_scope(permission_codes, user),
+    )
+    return ok({"items": [_opp_out(x) for x in items]})
+
+
+@router.post("/{customer_id}/opportunities")
+def create_opportunity_api(
+    customer_id: int,
+    payload: CrmOpportunityCreateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    owner_user_id = payload.owner_user_id
+    if owner_user_id is None:
+        owner_user_id = user.id
+    if owner_user_id is not None:
+        u = db.get(User, owner_user_id)
+        if not u or u.tenant_id != user.tenant_id:
+            raise HTTPException(status_code=400, detail="负责人不存在")
+    code = payload.code
+    if not code:
+        import uuid
+        code = f"OPP{user.tenant_id:03d}{uuid.uuid4().hex[:8].upper()}"
+    item = create_opportunity(
+        db,
+        tenant_id=user.tenant_id,
+        customer_id=customer_id,
+        code=code,
+        title=payload.title,
+        stage=payload.stage,
+        status=payload.status,
+        amount=payload.amount,
+        probability=payload.probability,
+        expected_close_date=payload.expected_close_date,
+        owner_user_id=owner_user_id,
+        remark=payload.remark,
+        is_active=payload.is_active,
+    )
+    db.commit()
+    return ok({"id": item.id, "code": item.code})
+
+
+@router.put("/{customer_id}/opportunities/{opportunity_id}")
+def update_opportunity_api(
+    customer_id: int,
+    opportunity_id: int,
+    payload: CrmOpportunityUpdateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    item = get_opportunity_by_id(db, tenant_id=user.tenant_id, opportunity_id=opportunity_id, with_activities=False)
+    if not item or item.customer_id != customer_id:
+        raise HTTPException(status_code=400, detail="销售机会不存在")
+    if not can_access_opportunity(db, user, item, permission_codes):
+        raise HTTPException(status_code=403, detail="无权访问该销售机会")
+    if payload.owner_user_id is not None:
+        u = db.get(User, payload.owner_user_id)
+        if not u or u.tenant_id != user.tenant_id:
+            raise HTTPException(status_code=400, detail="负责人不存在")
+    update_opportunity(
+        db,
+        item,
+        title=payload.title,
+        stage=payload.stage,
+        status=payload.status,
+        amount=payload.amount,
+        probability=payload.probability,
+        expected_close_date=payload.expected_close_date,
+        owner_user_id=payload.owner_user_id,
+        remark=payload.remark,
+        is_active=payload.is_active,
+    )
+    db.commit()
+    return ok({"id": item.id})
+
+
+@router.delete("/{customer_id}/opportunities/{opportunity_id}")
+def delete_opportunity_api(
+    customer_id: int,
+    opportunity_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    item = get_opportunity_by_id(db, tenant_id=user.tenant_id, opportunity_id=opportunity_id, with_activities=False)
+    if not item or item.customer_id != customer_id:
+        raise HTTPException(status_code=400, detail="销售机会不存在")
+    deactivate_opportunity(db, item)
+    db.commit()
+    return ok({"id": item.id})
+
+
+@router.get("/{customer_id}/opportunities/{opportunity_id}/activities")
+def list_opportunity_activities_api(
+    customer_id: int,
+    opportunity_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    opp = get_opportunity_by_id(db, tenant_id=user.tenant_id, opportunity_id=opportunity_id, with_activities=False)
+    if not opp or opp.customer_id != customer_id:
+        raise HTTPException(status_code=400, detail="销售机会不存在")
+    items = list_opportunity_activities(db, tenant_id=user.tenant_id, opportunity_id=opportunity_id)
+    return ok(
+        {
+            "items": [
+                {
+                    "id": x.id,
+                    "tenant_id": x.tenant_id,
+                    "opportunity_id": x.opportunity_id,
+                    "action_type": x.action_type,
+                    "content": x.content,
+                    "created_by": x.created_by,
+                    "created_by_name": x.creator.full_name if x.creator else None,
+                    "next_follow_up_at": x.next_follow_up_at,
+                    "created_at": x.created_at,
+                }
+                for x in items
+            ]
+        }
+    )
+
+
+@router.post("/{customer_id}/opportunities/{opportunity_id}/activities")
+def create_opportunity_activity_api(
+    customer_id: int,
+    opportunity_id: int,
+    payload: CrmOpportunityActivityCreateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    opp = get_opportunity_by_id(db, tenant_id=user.tenant_id, opportunity_id=opportunity_id, with_activities=False)
+    if not opp or opp.customer_id != customer_id:
+        raise HTTPException(status_code=400, detail="销售机会不存在")
+    if not can_access_opportunity(db, user, opp, permission_codes):
+        raise HTTPException(status_code=403, detail="无权访问该销售机会")
+    item = create_opportunity_activity(
+        db,
+        tenant_id=user.tenant_id,
+        opportunity_id=opportunity_id,
+        action_type=payload.action_type,
+        content=payload.content,
+        created_by=user.id,
+        next_follow_up_at=payload.next_follow_up_at,
+    )
+    db.commit()
+    return ok({"id": item.id})
+
+
+@router.post("/{customer_id}/opportunities/{opportunity_id}/convert-to-order")
+def convert_opportunity_to_order_api(
+    customer_id: int,
+    opportunity_id: int,
+    payload: OpportunityConvertToOrderIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    opp = get_opportunity_by_id(db, tenant_id=user.tenant_id, opportunity_id=opportunity_id, with_activities=False)
+    if not opp or opp.customer_id != customer_id:
+        raise HTTPException(status_code=400, detail="销售机会不存在")
+    if not can_access_opportunity(db, user, opp, permission_codes):
+        raise HTTPException(status_code=403, detail="无权操作该销售机会")
+    if opp.status != "open":
+        raise HTTPException(status_code=400, detail="仅进行中的销售机会可转订单")
+    if opp.converted_order_id:
+        raise HTTPException(status_code=400, detail="该销售机会已转订单")
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="请至少添加一行订单明细")
+
+    from app.crud.sku import get_sku_by_id
+
+    items_in: list[OrderItemCreateIn] = payload.items
+    order_items: list[tuple[int, int, int, str | None]] = []
+    for it in items_in:
+        sku = get_sku_by_id(db, tenant_id=user.tenant_id, sku_id=it.sku_id)
+        if not sku:
+            raise HTTPException(status_code=400, detail=f"型号不存在: {it.sku_id}")
+        order_items.append((it.line_no, it.sku_id, it.qty, it.remark))
+
+    order_code = resolve_code(
+        db,
+        tenant_id=user.tenant_id,
+        biz_type=BizType.ORDER,
+        code=None,
+        exists=lambda c: get_order_by_code(db, user.tenant_id, c) is not None,
+        duplicate_msg="订单号已存在",
+    )
+    remark = payload.remark or opp.title
+    order = create_order(
+        db,
+        tenant_id=user.tenant_id,
+        customer_id=customer_id,
+        code=order_code,
+        due_date=payload.due_date or opp.expected_close_date,
+        remark=remark,
+        items=order_items,
+        opportunity_id=opp.id,
+    )
+    update_opportunity(
+        db,
+        opp,
+        stage="won",
+        status="won",
+        converted_order_id=order.id,
+    )
+    create_opportunity_activity(
+        db,
+        tenant_id=user.tenant_id,
+        opportunity_id=opp.id,
+        action_type="convert_order",
+        content=f"已转订单 {order.code}",
+        created_by=user.id,
+    )
+    notify_users_with_permission(
+        db,
+        tenant_id=user.tenant_id,
+        permission_code="order.manage",
+        title="商机已转订单",
+        content=f"销售机会 {opp.code} 已转为订单 {order.code}，待审核",
+        level="info",
+        biz_type="order",
+        biz_id=order.id,
+    )
+    if opp.owner_user_id and opp.owner_user_id != user.id:
+        create_notification(
+            db,
+            tenant_id=user.tenant_id,
+            user_id=opp.owner_user_id,
+            title="商机已转订单",
+            content=f"销售机会 {opp.code} 已转为订单 {order.code}",
+            level="info",
+            biz_type="crm_opportunity",
+            biz_id=opp.id,
+        )
+    db.commit()
+    return ok({"order_id": order.id, "order_code": order.code, "opportunity_id": opp.id})
+
+
+@router.get("/{customer_id}/tags")
+def list_customer_tags_api(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    links = list_customer_tag_links(db, tenant_id=user.tenant_id, customer_id=customer_id)
+    return ok(
+        {
+            "items": [
+                {
+                    "tag_id": x.tag_id,
+                    "tag_name": x.tag.name if x.tag else None,
+                    "tag_color": x.tag.color if x.tag else None,
+                }
+                for x in links
+                if x.tag and x.tag.is_active
+            ]
+        }
+    )
+
+
+@router.put("/{customer_id}/tags")
+def set_customer_tags_api(
+    customer_id: int,
+    payload: CustomerTagsSetIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    try:
+        set_customer_tags(db, tenant_id=user.tenant_id, customer_id=customer_id, tag_ids=payload.tag_ids)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="标签不存在")
+    db.commit()
+    return ok({"customer_id": customer_id, "tag_ids": payload.tag_ids})
+
+
+# ============================================================
+# 客户 360 画像
+# ============================================================
+
+@router.get("/{customer_id}/profile")
+def get_customer_profile_api(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    from app.crud.crm import recalculate_customer_profile  # noqa: F401
+    cust = _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    profile_fn = getattr(__import__("app.crud.crm", fromlist=["get_customer_profile"]), "get_customer_profile", None)
+    if callable(profile_fn):
+        result = profile_fn(db, tenant_id=user.tenant_id, customer_id=customer_id)
+        if result is not None:
+            if isinstance(result, dict):
+                return ok(result)
+            data = {}
+            for attr in dir(result):
+                if attr.startswith("_"):
+                    continue
+                try:
+                    data[attr] = getattr(result, attr)
+                except Exception:
+                    continue
+            return ok(data)
+    # 兜底：返回基本信息 + 聚合字段占位
+    return ok({
+        "customer_id": getattr(cust, "id", customer_id),
+        "name": getattr(cust, "name", None),
+        "code": getattr(cust, "code", None),
+        "owner_user_id": getattr(cust, "owner_user_id", None),
+        "total_opportunities": 0,
+        "won_amount": 0.0,
+        "total_quotations": 0,
+        "total_contracts": 0,
+        "total_activities": 0,
+    })
+
+
+@router.post("/{customer_id}/profile/recalculate")
+def recalculate_customer_profile_api(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    mod = __import__("app.crud.crm", fromlist=["recalculate_customer_profile"])
+    fn = getattr(mod, "recalculate_customer_profile", None)
+    if not callable(fn):
+        raise HTTPException(status_code=501, detail="底层实现尚未就绪")
+    fn(db, tenant_id=user.tenant_id, customer_id=customer_id)
+    db.commit()
+    return ok({"customer_id": customer_id, "recalculated": True})
+
+
+@router.post("/{customer_id}/leads/convert")
+def convert_customer_leads_api(
+    customer_id: int,
+    payload: dict = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    """将某客户下的线索（或指定 lead_id）转为机会/客户。"""
+    _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    import app.crud.crm as _crm
+    fn = getattr(_crm, "convert_customer_leads", None)
+    if not callable(fn):
+        raise HTTPException(status_code=501, detail="底层实现尚未就绪")
+    data = payload.dict(exclude_unset=True) if hasattr(payload, "dict") else (dict(payload) if payload else {})
+    result = fn(db, tenant_id=user.tenant_id, customer_id=customer_id, user_id=user.id, **data)
+    db.commit()
+    if isinstance(result, dict):
+        return ok(result)
+    return ok({"customer_id": customer_id, "converted": True})
+
+
+
+@router.get("/suggest/{customer_id}")
+def customer_suggest_api(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    permission_codes: list[str] = Depends(get_current_permissions),
+):
+    """智能补全：给定客户 id 返回补全包（主联系人/电话/地址/行业/等级），供下单等表单回填。"""
+    c = _need_customer(db, user.tenant_id, customer_id, user, permission_codes)
+    return ok({
+        "id": c.id,
+        "code": c.code,
+        "name": c.name,
+        "contact_name": c.contact_name,
+        "contact_phone": c.contact_phone,
+        "address": c.address,
+        "industry": getattr(c, "industry", None),
+        "customer_level": getattr(c, "customer_level", None),
+        "remark": c.remark,
+    })

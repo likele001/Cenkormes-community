@@ -1,0 +1,178 @@
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
+
+from app.core.deps import get_current_user, get_db, require_permissions
+from app.core.response import ok
+from app.models.temp_report import TempReport
+from app.models.task import Task
+from app.models.work_order import WorkOrder
+from app.models.user import User
+from app.crud.report import (
+    calc_and_create_salary,
+    create_report,
+    update_report_status,
+)
+from app.crud.task import sync_task_progress
+from app.crud.trace import generate_trace_code
+from app.services.mold_shot_tracker import increment_mold_shots_for_task
+
+
+router = APIRouter(dependencies=[Depends(require_permissions(["report.audit"]))])
+
+
+def _temp_out(t) -> dict:
+    return {
+        "id": t.id,
+        "user_id": t.user_id,
+        "product_id": t.product_id,
+        "sku_id": t.sku_id,
+        "process_id": t.process_id,
+        "good_qty": t.good_qty,
+        "bad_qty": t.bad_qty,
+        "remark": t.remark,
+        "attachment_ids": t.attachment_ids,
+        "status": t.status,
+        "bound_task_id": t.bound_task_id,
+        "bound_report_id": t.bound_report_id,
+        "qty_bound": t.qty_bound,
+        "bound_by": t.bound_by,
+        "bound_at": t.bound_at,
+        "created_at": t.created_at,
+        "total_qty": t.good_qty + t.bad_qty,
+        "remaining_qty": max(0, (t.good_qty + t.bad_qty) - (t.qty_bound or 0)),
+        "user": ({"id": t.user.id, "full_name": t.user.full_name, "username": t.user.username} if t.user else None),
+        "product": ({"id": t.product.id, "code": t.product.code, "name": t.product.name} if t.product else None),
+        "sku": ({"id": t.sku.id, "code": t.sku.code, "name": t.sku.name} if t.sku else None),
+        "process": ({"id": t.process.id, "code": t.process.code, "name": t.process.name} if t.process else None),
+        "bound_task": (
+            {"id": t.bound_task.id, "task_code": t.bound_task.task_code} if t.bound_task else None
+        ),
+    }
+
+
+class TempReportBindIn(BaseModel):
+    task_id: int = Field(ge=1, description="绑定到哪个任务(工序)")
+    qty_bound: int = Field(ge=1, description="本次并入的合格数量")
+
+
+@router.get("/temp-reports")
+def list_temp_reports_api(
+    status: str | None = Query(default=None, description="pending/bound/void"),
+    user_id: int | None = Query(default=None, ge=1),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    stmt = (
+        select(TempReport)
+        .where(TempReport.tenant_id == user.tenant_id)
+        .options(
+            selectinload(TempReport.user),
+            selectinload(TempReport.product),
+            selectinload(TempReport.sku),
+            selectinload(TempReport.process),
+            selectinload(TempReport.bound_task),
+        )
+    )
+    if status and status != "all":
+        stmt = stmt.where(TempReport.status == status)
+    if user_id is not None:
+        stmt = stmt.where(TempReport.user_id == user_id)
+    total = len(db.scalars(select(TempReport.id).where(TempReport.tenant_id == user.tenant_id)).all())
+    stmt = stmt.order_by(TempReport.id.desc()).offset(offset).limit(limit)
+    items = db.scalars(stmt).all()
+    return ok({"items": [_temp_out(t) for t in items], "total": total})
+
+
+@router.post("/temp-reports/{temp_report_id}/bind")
+def bind_temp_report_api(
+    temp_report_id: int,
+    payload: TempReportBindIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    temp = db.get(TempReport, temp_report_id)
+    if not temp or temp.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=400, detail="临时报工不存在")
+    if temp.status != "pending":
+        raise HTTPException(status_code=400, detail="仅待关联的临时报工可绑定")
+    remaining = (temp.good_qty + temp.bad_qty) - (temp.qty_bound or 0)
+    if payload.qty_bound > remaining:
+        raise HTTPException(status_code=400, detail=f"绑定数量超过剩余可绑数量 {remaining}")
+
+    task = db.scalar(
+        select(Task).where(Task.tenant_id == user.tenant_id, Task.id == payload.task_id)
+    )
+    if not task:
+        raise HTTPException(status_code=400, detail="目标任务不存在")
+    if task.status == "done":
+        raise HTTPException(status_code=400, detail="目标任务已完成")
+
+    # 1) 生成正式报工记录（并入工单/良品统计/计件）
+    report = create_report(
+        db,
+        tenant_id=user.tenant_id,
+        task_id=task.id,
+        report_user_id=temp.user_id,
+        good_qty=payload.qty_bound,
+        bad_qty=0,
+        remark=(temp.remark or "") + f"（经临时报工 #{temp.id} 绑定）",
+        attachment_ids=temp.attachment_ids,
+    )
+    # 绑定即视为一次终审通过（由绑定管理员负责核对）
+    update_report_status(db, report, "qc_approved")
+
+    # 2) 复用正式终审链路：计件工资 + 追溯码 + 任务/工单/订单进度推进
+    salary = calc_and_create_salary(db, tenant_id=user.tenant_id, report=report)
+    increment_mold_shots_for_task(db, user.tenant_id, process_id=task.process_id, qty=report.good_qty)
+    trace_code = None
+    wo = db.get(WorkOrder, task.work_order_id)
+    if wo:
+        try:
+            trace_code = generate_trace_code(
+                db,
+                tenant_id=user.tenant_id,
+                order_id=wo.order_id,
+                sku_id=wo.sku_id,
+                process_id=task.process_id,
+                user_id=temp.user_id,
+                work_order_id=wo.id,
+                task_seq=int(task.seq),
+                report_id=report.id,
+                qty=report.good_qty,
+            )
+        except Exception:
+            trace_code = None
+        try:
+            sync_task_progress(db, user.tenant_id, task)
+        except Exception:
+            pass
+
+    # 3) 回写临时报工的绑定信息（支持部分绑定/拆单）
+    temp.bound_task_id = task.id
+    temp.bound_report_id = report.id
+    temp.qty_bound = (temp.qty_bound or 0) + payload.qty_bound
+    temp.bound_by = user.id
+    temp.bound_at = datetime.now()
+    if temp.qty_bound >= temp.good_qty + temp.bad_qty:
+        temp.status = "bound"
+
+    try:
+        from app.services.ws_hub import broadcast_sync
+        broadcast_sync(user.tenant_id, {"type": "refresh", "channel": "dashboard", "biz": "report"})
+    except Exception:
+        pass
+
+    db.commit()
+    return ok({
+        "temp_report_id": temp.id,
+        "status": temp.status,
+        "qty_bound": temp.qty_bound,
+        "report_id": report.id,
+        "trace_code": trace_code.code if trace_code else None,
+    })

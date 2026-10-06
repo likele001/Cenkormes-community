@@ -1,0 +1,376 @@
+import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
+import { ElMessage } from 'element-plus'
+import { i18n } from '@/locales'
+
+import { getH5PortalKind, redirectToH5Portal } from '@/utils/h5-entry'
+import { getStoredTenantCode, parseTenantFromPath, setStoredTenantCode, tenantAdminPath } from '@/utils/tenant'
+import { tryRecoverStaleChunk } from '@/utils/chunk-reload'
+import { getPlatformToken } from '@/api/platform'
+
+const appChildren: RouteRecordRaw[] = [
+      { path: '', redirect: 'home' },
+      { path: 'home', name: 'home', component: () => import('@/pages/HomePage.vue'), meta: { title: () => i18n.global.t('menu.home'), permissions: ['dashboard.view'] } },
+      {
+        path: 'dashboard/kanban',
+        name: 'dashboard-kanban',
+        component: () => import('@/pages/dashboard/KanbanOrdersPage.vue'),
+        meta: { title: () => i18n.global.t('menu.kanban'), permissions: ['dashboard.view'] },
+      },
+      {
+        path: 'dashboard/kanban/orders/:id',
+        name: 'dashboard-kanban-order',
+        component: () => import('@/pages/dashboard/KanbanOrderDetailPage.vue'),
+        meta: { title: () => i18n.global.t('menu.orderProgress'), permissions: ['dashboard.view'] },
+      },
+      {
+        path: 'dashboard/screen',
+        name: 'dashboard-screen',
+        component: () => import('@/pages/dashboard/DashboardScreenPage.vue'),
+        meta: { title: () => i18n.global.t('menu.screen'), permissions: ['dashboard.view'] },
+      },
+
+      { path: 'reports', name: 'reports', component: () => import('@/pages/reports/DataReportsPage.vue'), meta: { title: () => i18n.global.t('menu.reportsOverview'), permissions: ['report.view'] } },
+      { path: 'reports/purchase', name: 'reports-purchase', component: () => import('@/pages/reports/PurchaseStatsPage.vue'), meta: { title: () => i18n.global.t('menu.reportsPurchase'), permissions: ['report.view'] } },
+      { path: 'dashboard', redirect: '/dashboard/kanban' },
+
+      { path: 'system/invites', name: 'system-invites', component: () => import('@/pages/system/InvitesPage.vue'), meta: { title: () => i18n.global.t('menu.invites'), permissions: ['user.manage'] } },
+      { path: 'system/users', name: 'system-users', component: () => import('@/pages/system/UsersPage.vue'), meta: { title: () => i18n.global.t('menu.users'), permissions: ['user.manage'] } },
+      { path: 'system/roles', name: 'system-roles', component: () => import('@/pages/system/RolesPage.vue'), meta: { title: () => i18n.global.t('menu.roles'), permissions: ['role.manage'] } },
+      { path: 'system/permissions', name: 'system-permissions', component: () => import('@/pages/system/PermissionsPage.vue'), meta: { title: () => i18n.global.t('menu.permissions'), permissions: ['permission.manage'] } },
+      { path: 'system/departments', name: 'system-departments', component: () => import('@/pages/system/DepartmentsPage.vue'), meta: { title: () => i18n.global.t('menu.departments'), permissions: ['department.manage'] } },
+      { path: 'system/settings', name: 'system-settings', component: () => import('@/pages/system/SettingsPage.vue'), meta: { title: () => i18n.global.t('menu.settings'), permissions: ['setting.manage'] } },
+      { path: 'system/feishu-notify', name: 'system-feishu-notify', component: () => import('@/pages/system/FeishuNotifyPage.vue'), meta: { title: () => i18n.global.t('menu.feishuNotify'), permissions: ['setting.manage'] } },
+      { path: 'system/wecom-notify', name: 'system-wecom-notify', component: () => import('@/pages/system/WecomNotifyPage.vue'), meta: { title: () => i18n.global.t('menu.wecomNotify'), permissions: ['setting.manage'] } },
+      { path: 'system/dingtalk-notify', name: 'system-dingtalk-notify', component: () => import('@/pages/system/DingtalkNotifyPage.vue'), meta: { title: () => i18n.global.t('menu.dingtalkNotify'), permissions: ['setting.manage'] } },
+      { path: 'system/message-center', name: 'system-message-center', component: () => import('@/pages/system/MessageCenterPage.vue'), meta: { title: () => i18n.global.t('menu.messageCenter'), permissions: ['setting.manage'] } },
+      { path: 'system/push-monitor', name: 'system-push-monitor', component: () => import('@/pages/system/PushMonitorPage.vue'), meta: { title: () => i18n.global.t('menu.pushMonitor'), permissions: ['setting.manage'] } },
+      { path: 'system/cron-jobs', name: 'system-cron-jobs', component: () => import('@/pages/system/CronJobsPage.vue'), meta: { title: () => i18n.global.t('menu.cronJobs'), permissions: ['setting.manage'] } },
+      { path: 'system/approval-flows', name: 'system-approval-flows', component: () => import('@/pages/system/ApprovalFlowsPage.vue'), meta: { title: () => i18n.global.t('menu.approvalFlows'), permissions: ['setting.manage'] } },
+      {
+        path: 'system/automation-settings',
+        name: 'system-automation-settings',
+        component: () => import('@/pages/system/AutomationSettingsPage.vue'),
+        meta: { title: () => i18n.global.t('menu.automationSettings'), permissions: ['setting.manage'] },
+      },
+      { path: 'system/help', name: 'system-help', component: () => import('@/pages/system/HelpPage.vue'), meta: { title: () => i18n.global.t('menu.intelHelp'), permissions: ['ai.use'] } },
+      { path: 'system/ai-deep', name: 'system-ai-deep', component: () => import('@/pages/system/AiDeepPage.vue'), meta: { title: () => i18n.global.t('menu.aiDeep'), permissions: ['ai.use'] } },
+      { path: 'system/ai-stats', name: 'system-ai-stats', component: () => import('@/pages/system/AiStatsPage.vue'), meta: { title: () => i18n.global.t('menu.aiStats'), permissions: ['ai.use'] } },
+
+      // AI 智能模块
+      { path: 'ai/equipment-health', name: 'ai-equipment-health', component: () => import('@/pages/ai/EquipmentHealthEnhancedPage.vue'), meta: { title: () => i18n.global.t('menu.aiEquipmentHealth'), permissions: ['ai.use'] } },
+      { path: 'ai/yield-prediction', name: 'ai-yield-prediction', component: () => import('@/pages/ai/YieldPredictionPage.vue'), meta: { title: () => i18n.global.t('menu.aiYieldPrediction'), permissions: ['ai.use'] } },
+      { path: 'ai/twin', name: 'ai-twin', component: () => import('@/pages/ai/TwinEnhancedPage.vue'), meta: { title: () => i18n.global.t('menu.aiTwin'), permissions: ['ai.use'] } },
+      { path: 'ai/causal', name: 'ai-causal', component: () => import('@/pages/ai/CausalEnhancedPage.vue'), meta: { title: () => i18n.global.t('menu.aiCausal'), permissions: ['ai.use'] } },
+      { path: 'ai/quality-patterns', name: 'ai-quality-patterns', component: () => import('@/pages/ai/QualityPatternPage.vue'), meta: { title: () => i18n.global.t('menu.aiQualityPatterns'), permissions: ['ai.use'] } },
+      { path: 'ai/pricing', name: 'ai-pricing', component: () => import('@/pages/ai/PricingEnhancedPage.vue'), meta: { title: () => i18n.global.t('menu.aiPricing'), permissions: ['ai.use'] } },
+      { path: 'ai/recommendations', name: 'ai-recommendations', component: () => import('@/pages/ai/RecommendationsPage.vue'), meta: { title: () => i18n.global.t('menu.aiRecommendations'), permissions: ['ai.use'] } },
+      { path: 'ai/alerts', name: 'ai-alerts', component: () => import('@/pages/ai/AiAlertCenterPage.vue'), meta: { title: () => i18n.global.t('menu.aiAlerts'), permissions: ['ai.alert.view'] } },
+      { path: 'ai/employees', name: 'ai-employees', component: () => import('@/pages/ai/AiEmployeesPage.vue'), meta: { title: () => i18n.global.t('menu.aiEmployees'), permissions: ['ai_employee.manage'] } },
+      { path: 'ai/agent-chat', name: 'ai-agent-chat', component: () => import('@/pages/ai/AgentChatPage.vue'), meta: { title: () => i18n.global.t('menu.aiAgentChat'), permissions: ['ai.use'] } },
+      { path: 'ai/assistant', name: 'ai-assistant', component: () => import('@/pages/ai/AiAssistantPage.vue'), meta: { title: () => i18n.global.t('menu.aiAssistant'), permissions: ['ai.use'] } },
+      { path: 'ai/rag-index', name: 'ai-rag-index', component: () => import('@/pages/ai/RagIndexPage.vue'), meta: { title: () => i18n.global.t('menu.aiRagIndex'), permissions: ['ai.use'] } },
+      { path: 'system/print-templates', name: 'system-print-templates', component: () => import('@/pages/system/PrintTemplatesPage.vue'), meta: { title: () => i18n.global.t('menu.printTemplates'), permissions: ['print_template.manage'] } },
+      { path: 'system/notifications', name: 'system-notifications', component: () => import('@/pages/system/NotificationsPage.vue'), meta: { title: () => i18n.global.t('menu.notifications'), permissions: ['notification.view'] } },
+      { path: 'system/attendance-records', name: 'system-attendance-records', component: () => import('@/pages/system/AttendanceRecordsPage.vue'), meta: { title: () => i18n.global.t('menu.attendanceRecords'), permissions: ['attendance.manage'] } },
+      { path: 'system/skills', name: 'system-skills', component: () => import('@/pages/system/SkillsPage.vue'), meta: { title: () => i18n.global.t('menu.skills'), permissions: ['skill.manage'] } },
+      { path: 'system/dictionary', name: 'system-dictionary', component: () => import('@/pages/system/DictionaryPage.vue'), meta: { title: () => i18n.global.t('menu.dictionary'), permissions: ['dict.manage'] } },
+      { path: 'system/attachments', name: 'system-attachments', component: () => import('@/pages/system/AttachmentsPage.vue'), meta: { title: () => i18n.global.t('menu.attachments'), permissions: ['attachment.view'] } },
+      { path: 'system/operation-logs', name: 'system-operation-logs', component: () => import('@/pages/system/OperationLogsPage.vue'), meta: { title: () => i18n.global.t('menu.operationLogs'), permissions: ['operation_log.view'] } },
+      { path: 'system/industry-packs', name: 'system-industry-packs', component: () => import('@/pages/system/IndustryPacksPage.vue'), meta: { title: () => '行业包管理', permissions: ['setting.manage'] } },
+      { path: 'system/about', name: 'system-about', component: () => import('@/pages/system/SystemAboutPage.vue'), meta: { title: () => i18n.global.t('menu.systemAbout'), permissions: ['setting.manage'] } },
+      { path: 'production/shifts', name: 'production-shifts', component: () => import('@/pages/production/ShiftsPage.vue'), meta: { title: () => i18n.global.t('menu.shifts'), permissions: ['attendance.manage'] } },
+      { path: 'account/profile', name: 'account-profile', component: () => import('@/pages/account/ProfilePage.vue'), meta: { title: () => i18n.global.t('menu.profile') } },
+
+      { path: 'master/products', name: 'master-products', component: () => import('@/pages/master/ProductsPage.vue'), meta: { title: () => i18n.global.t('menu.products'), permissions: ['product.manage'] } },
+      { path: 'master/skus', name: 'master-skus', component: () => import('@/pages/master/SkusPage.vue'), meta: { title: () => i18n.global.t('menu.skus'), permissions: ['sku.manage'] } },
+      { path: 'master/skus/batch', name: 'master-skus-batch', component: () => import('@/pages/master/SkuBatchWithPricesPage.vue'), meta: { title: () => i18n.global.t('menu.skusBatch'), permissions: ['sku.manage', 'price.manage'] } },
+      { path: 'master/suppliers', name: 'master-suppliers', component: () => import('@/pages/master/SuppliersPage.vue'), meta: { title: () => i18n.global.t('menu.suppliers'), permissions: ['supplier.manage'] } },
+      { path: 'master/materials', name: 'master-materials', component: () => import('@/pages/master/MaterialsPage.vue'), meta: { title: () => i18n.global.t('menu.materials'), permissions: ['material.manage'] } },
+      { path: 'master/boms', name: 'master-boms', component: () => import('@/pages/master/BomsPage.vue'), meta: { title: () => i18n.global.t('menu.boms'), permissions: ['bom.manage'] } },
+      { path: 'master/processes', name: 'master-processes', component: () => import('@/pages/master/ProcessesPage.vue'), meta: { title: () => i18n.global.t('menu.processes'), permissions: ['process.manage'] } },
+      { path: 'master/process-routes', name: 'master-process-routes', component: () => import('@/pages/master/ProcessRoutesPage.vue'), meta: { title: () => i18n.global.t('menu.processRoutes'), permissions: ['product.manage'] } },
+      { path: 'master/process-prices', name: 'master-process-prices', component: () => import('@/pages/master/ProcessPricesPage.vue'), meta: { title: () => i18n.global.t('menu.processPrices'), permissions: ['price.manage'] } },
+
+      { path: 'plans', name: 'plans', component: () => import('@/pages/production/PlansPage.vue'), meta: { title: () => i18n.global.t('menu.plans'), permissions: ['plan.manage'] } },
+      { path: 'plans/new', name: 'plans-new', component: () => import('@/pages/production/PlanFormPage.vue'), meta: { title: () => i18n.global.t('menu.planNew'), permissions: ['plan.manage'] } },
+      { path: 'plans/:id/edit', name: 'plans-edit', component: () => import('@/pages/production/PlanFormPage.vue'), meta: { title: () => i18n.global.t('menu.planEdit'), permissions: ['plan.manage'] } },
+      { path: 'warehouse/shipments', name: 'warehouse-shipments', component: () => import('@/pages/warehouse/ShipmentsPage.vue'), meta: { title: () => i18n.global.t('menu.shipments'), permissions: ['order.manage'] } },
+      { path: 'warehouse/stocks', name: 'warehouse-stocks', component: () => import('@/pages/warehouse/StocksPage.vue'), meta: { title: () => i18n.global.t('menu.stocks'), permissions: ['warehouse.manage'] } },
+      { path: 'warehouse/warehouses', name: 'warehouse-warehouses', component: () => import('@/pages/warehouse/WarehousesPage.vue'), meta: { title: () => i18n.global.t('menu.warehouses'), permissions: ['warehouse.manage'] } },
+      { path: 'warehouse/material-issues', name: 'warehouse-material-issues', component: () => import('@/pages/warehouse/MaterialIssuesPage.vue'), meta: { title: () => i18n.global.t('menu.materialIssues'), permissions: ['warehouse.manage'] } },
+      { path: 'warehouse/material-returns', name: 'warehouse-material-returns', component: () => import('@/pages/warehouse/MaterialReturnsPage.vue'), meta: { title: () => i18n.global.t('menu.materialReturns'), permissions: ['warehouse.manage'] } },
+      { path: 'warehouse/entries', name: 'warehouse-entries', component: () => import('@/pages/warehouse/WarehouseEntriesPage.vue'), meta: { title: () => i18n.global.t('menu.warehouseEntries'), permissions: ['warehouse.manage'] } },
+      { path: 'purchase/orders', name: 'purchase-orders', component: () => import('@/pages/purchase/PurchaseOrdersPage.vue'), meta: { title: () => i18n.global.t('menu.purchaseOrders'), permissions: ['purchase.manage'] } },
+      { path: 'purchase/orders/:id', name: 'purchase-order-detail', component: () => import('@/pages/purchase/PurchaseOrderDetailPage.vue'), meta: { title: () => i18n.global.t('menu.purchaseOrderDetail'), permissions: ['purchase.manage'] } },
+      { path: 'purchase/statements', name: 'purchase-statements', component: () => import('@/pages/purchase/PurchaseStatementsPage.vue'), meta: { title: () => i18n.global.t('menu.purchaseStatements'), permissions: ['purchase.manage'] } },
+      { path: 'purchase/statements/new', name: 'purchase-statements-new', component: () => import('@/pages/purchase/PurchaseStatementFormPage.vue'), meta: { title: () => i18n.global.t('menu.purchaseStatementNew'), permissions: ['purchase.manage'] } },
+      { path: 'purchase/statements/:id', name: 'purchase-statement-detail', component: () => import('@/pages/purchase/PurchaseStatementDetailPage.vue'), meta: { title: () => i18n.global.t('menu.purchaseStatementDetail'), permissions: ['purchase.manage'] } },
+
+      { path: 'finance/statements', name: 'finance-statements', component: () => import('@/pages/finance/CustomerStatementsPage.vue'), meta: { title: () => i18n.global.t('menu.financeStatements'), permissions: ['finance.manage'] } },
+      { path: 'finance/statements/:id', name: 'finance-statement-detail', component: () => import('@/pages/finance/CustomerStatementDetailPage.vue'), meta: { title: () => i18n.global.t('menu.financeStatementDetail'), permissions: ['finance.manage'] } },
+      { path: 'finance/ledgers', name: 'finance-ledgers', component: () => import('@/pages/finance/LedgersPage.vue'), meta: { title: () => i18n.global.t('menu.financeLedgers'), permissions: ['finance.manage'] } },
+      { path: 'finance/payables', name: 'finance-payables', component: () => import('@/pages/finance/PayablesPage.vue'), meta: { title: () => i18n.global.t('menu.financePayables'), permissions: ['finance.manage'] } },
+      { path: 'finance/profit', name: 'finance-profit', component: () => import('@/pages/finance/ProfitPage.vue'), meta: { title: () => i18n.global.t('menu.financeProfit'), permissions: ['finance.manage'] } },
+      { path: 'erp/invoices', name: 'erp-invoices', component: () => import('@/pages/erp/InvoicesPage.vue'), meta: { title: () => i18n.global.t('menu.erpInvoices'), permissions: ['erp.manage'] } },
+      { path: 'erp/accounts', name: 'erp-accounts', component: () => import('@/pages/erp/AccountsPage.vue'), meta: { title: () => i18n.global.t('menu.erpAccounts'), permissions: ['erp.manage'] } },
+      { path: 'erp/vouchers', name: 'erp-vouchers', component: () => import('@/pages/erp/VouchersPage.vue'), meta: { title: () => i18n.global.t('menu.erpVouchers'), permissions: ['erp.manage'] } },
+      { path: 'erp/trial-balance', name: 'erp-trial-balance', component: () => import('@/pages/erp/TrialBalancePage.vue'), meta: { title: () => i18n.global.t('menu.erpTrialBalance'), permissions: ['erp.manage'] } },
+      { path: 'erp/balance-sheet', name: 'erp-balance-sheet', component: () => import('@/pages/erp/BalanceSheetPage.vue'), meta: { title: () => i18n.global.t('menu.erpBalanceSheet'), permissions: ['erp.manage'] } },
+      { path: 'erp/costs', name: 'erp-costs', component: () => import('@/pages/erp/WorkOrderCostsPage.vue'), meta: { title: () => i18n.global.t('menu.erpCosts'), permissions: ['erp.manage'] } },
+      { path: 'erp/assets', name: 'erp-assets', component: () => import('@/pages/erp/AssetsPage.vue'), meta: { title: () => i18n.global.t('menu.erpAssets'), permissions: ['erp.manage'] } },
+      { path: 'erp/assets/depreciation', name: 'erp-asset-depreciation', component: () => import('@/pages/erp/AssetDepreciationPage.vue'), meta: { title: () => i18n.global.t('menu.erpAssetDepreciation'), permissions: ['erp.manage'] } },
+      { path: 'erp/assets/checks', name: 'erp-asset-checks', component: () => import('@/pages/erp/AssetCheckPage.vue'), meta: { title: () => i18n.global.t('menu.erpAssetChecks'), permissions: ['erp.manage'] } },
+
+      { path: 'crm/opportunities', name: 'crm-opportunities', component: () => import('@/pages/crm/CrmOpportunitiesPage.vue'), meta: { title: () => i18n.global.t('menu.crmOpportunities'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/pipeline', name: 'crm-pipeline', component: () => import('@/pages/crm/CrmPipelinePage.vue'), meta: { title: () => i18n.global.t('menu.crmPipeline'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/public-pool', name: 'crm-public-pool', component: () => import('@/pages/crm/CrmPublicPoolPage.vue'), meta: { title: () => i18n.global.t('menu.crmPublicPool'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/opportunity-stats', name: 'crm-opportunity-stats', component: () => import('@/pages/crm/CrmOpportunityStatsPage.vue'), meta: { title: () => i18n.global.t('menu.crmOpportunityStats'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/tags', name: 'crm-tags', component: () => import('@/pages/crm/CrmTagsPage.vue'), meta: { title: () => i18n.global.t('menu.crmTags'), permissions: ['customer.manage'] } },
+      { path: 'crm/after-sales', name: 'crm-after-sales', component: () => import('@/pages/crm/CrmAfterSalesPage.vue'), meta: { title: () => i18n.global.t('menu.crmAfterSales'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/settings', name: 'crm-settings', component: () => import('@/pages/crm/CrmSettingsPage.vue'), meta: { title: () => i18n.global.t('menu.crmSettings'), permissions: ['customer.manage'] } },
+
+      // ---- CRM 扩展 ----
+      { path: 'crm/leads', name: 'crm-leads', component: () => import('@/pages/crm/CrmLeadsPage.vue'), meta: { title: () => i18n.global.t('menu.crmLeads'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/leads/new', name: 'crm-lead-new', component: () => import('@/pages/crm/CrmLeadDetailPage.vue'), meta: { title: () => '新增线索', permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/leads/:id', name: 'crm-lead-detail', component: () => import('@/pages/crm/CrmLeadDetailPage.vue'), meta: { title: () => '线索详情', permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/quotations', name: 'crm-quotations', component: () => import('@/pages/crm/CrmQuotationsPage.vue'), meta: { title: () => i18n.global.t('menu.crmQuotations'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/quotations/new', name: 'crm-quotation-new', component: () => import('@/pages/crm/CrmQuotationCreatePage.vue'), meta: { title: () => '新增报价单', permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/quotations/:id', name: 'crm-quotation-detail', component: () => import('@/pages/crm/CrmQuotationCreatePage.vue'), meta: { title: () => '报价单详情', permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/quotations/:id/edit', name: 'crm-quotation-edit', component: () => import('@/pages/crm/CrmQuotationCreatePage.vue'), meta: { title: () => '编辑报价单', permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/contracts', name: 'crm-contracts', component: () => import('@/pages/crm/CrmContractsPage.vue'), meta: { title: () => i18n.global.t('menu.crmContracts'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/contracts/new', name: 'crm-contract-new', component: () => import('@/pages/crm/CrmContractCreatePage.vue'), meta: { title: () => '新增合同', permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/contracts/:id', name: 'crm-contract-detail', component: () => import('@/pages/crm/CrmContractCreatePage.vue'), meta: { title: () => '合同详情', permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/campaigns', name: 'crm-campaigns', component: () => import('@/pages/crm/CrmCampaignsPage.vue'), meta: { title: () => i18n.global.t('menu.crmCampaigns'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/campaigns/new', name: 'crm-campaign-new', component: () => import('@/pages/crm/CrmCampaignCreatePage.vue'), meta: { title: () => '新增活动', permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/campaigns/:id', name: 'crm-campaign-detail', component: () => import('@/pages/crm/CrmCampaignCreatePage.vue'), meta: { title: () => '活动详情', permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/sales-targets', name: 'crm-sales-targets', component: () => import('@/pages/crm/CrmSalesTargetsPage.vue'), meta: { title: () => i18n.global.t('menu.crmSalesTargets'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/win-loss-reasons', name: 'crm-win-loss-reasons', component: () => import('@/pages/crm/CrmWinLossReasonsPage.vue'), meta: { title: () => i18n.global.t('menu.crmWinLossReasons'), permissions: ['customer.manage'] } },
+      { path: 'crm/customer-profile', name: 'crm-customer-profile', component: () => import('@/pages/crm/CrmCustomerProfilePage.vue'), meta: { title: () => i18n.global.t('menu.crmCustomerProfile'), permissions: ['customer.manage', 'crm.sales'] } },
+      { path: 'crm/import-export', name: 'crm-import-export', component: () => import('@/pages/crm/CrmImportExportPage.vue'), meta: { title: () => i18n.global.t('menu.crmImportExport'), permissions: ['customer.manage'] } },
+
+      {
+        path: 'production/customers',
+        name: 'production-customers',
+        component: () => import('@/pages/production/CustomersPage.vue'),
+        meta: { title: () => i18n.global.t('menu.customers'), permissions: ['customer.manage', 'crm.sales'] },
+      },
+      {
+        path: 'production/customers/:id',
+        name: 'production-customer-detail',
+        component: () => import('@/pages/production/CustomerDetailPage.vue'),
+        meta: { title: () => i18n.global.t('menu.customerDetail'), permissions: ['customer.manage', 'crm.sales'] },
+      },
+      {
+        path: 'production/orders',
+        name: 'production-orders',
+        component: () => import('@/pages/production/OrdersPage.vue'),
+        meta: { title: () => i18n.global.t('menu.orders'), permissions: ['order.manage'] },
+      },
+      {
+        path: 'production/orders/import',
+        name: 'production-orders-import',
+        component: () => import('@/pages/production/OrderImportPage.vue'),
+        meta: { title: () => i18n.global.t('menu.orderImport'), permissions: ['order.manage'] },
+      },
+      {
+        path: 'production/work-orders',
+        name: 'production-work-orders',
+        component: () => import('@/pages/production/WorkOrdersPage.vue'),
+        meta: { title: () => i18n.global.t('menu.workOrders'), permissions: ['work.manage'] },
+      },
+      {
+        path: 'production/tasks',
+        name: 'production-tasks',
+        component: () => import('@/pages/production/TasksPage.vue'),
+        meta: { title: () => i18n.global.t('menu.tasks'), permissions: ['task.manage', 'dispatch.manage'] },
+      },
+      {
+        path: 'production/assignments',
+        name: 'production-assignments',
+        component: () => import('@/pages/production/AssignmentsPage.vue'),
+        meta: { title: () => i18n.global.t('menu.assignments'), permissions: ['dispatch.manage'] },
+      },
+      {
+        path: 'production/inspection-templates',
+        name: 'production-inspection-templates',
+        component: () => import('@/pages/production/InspectionTemplatesPage.vue'),
+        meta: { title: () => i18n.global.t('menu.inspectionTemplates'), permissions: ['report.audit'] },
+      },
+      {
+        path: 'production/defect-codes',
+        name: 'production-defect-codes',
+        component: () => import('@/pages/production/DefectCodesPage.vue'),
+        meta: { title: () => i18n.global.t('menu.defectCodes'), permissions: ['report.audit'] },
+      },
+      {
+        path: 'production/report-units',
+        name: 'production-report-units',
+        component: () => import('@/pages/production/ReportUnitsPage.vue'),
+        meta: { title: () => i18n.global.t('menu.reportUnits'), permissions: ['report.audit'] },
+      },
+      {
+        path: 'production/reports',
+        name: 'production-reports',
+        component: () => import('@/pages/production/ReportsPage.vue'),
+        meta: { title: () => i18n.global.t('menu.reports'), permissions: ['report.audit'] },
+      },
+      {
+        path: 'production/temp-reports',
+        name: 'production-temp-reports',
+        component: () => import('@/pages/production/TempReportsPage.vue'),
+        meta: { title: () => i18n.global.t('menu.tempReports'), permissions: ['report.audit'] },
+      },
+      {
+        path: 'production/salary',
+        name: 'production-salary',
+        component: () => import('@/pages/production/SalaryPage.vue'),
+        meta: { title: () => i18n.global.t('menu.salary'), permissions: ['salary.manage'] },
+      },
+      {
+        path: 'production/salary-slips',
+        name: 'production-salary-slips',
+        component: () => import('@/pages/production/SalarySlipsPage.vue'),
+        meta: { title: () => i18n.global.t('menu.salarySlips'), permissions: ['salary.manage'] },
+      },
+      {
+        path: 'production/equipment',
+        name: 'production-equipment',
+        component: () => import('@/pages/production/EquipmentPage.vue'),
+        meta: { title: () => i18n.global.t('menu.equipment'), permissions: ['equipment.manage'] },
+      },
+      {
+        path: 'production/trace',
+        name: 'production-trace',
+        component: () => import('@/pages/production/TracePage.vue'),
+        meta: { title: () => i18n.global.t('menu.trace'), permissions: ['trace.query'] },
+      },
+      {
+        path: 'production/hourly-salary',
+        name: 'production-hourly-salary',
+        component: () => import('@/pages/production/HourlySalaryPage.vue'),
+        meta: { title: () => i18n.global.t('menu.hourlySalary'), permissions: ['salary.manage'] },
+      },
+      {
+        path: ':pathMatch(.*)*',
+        name: 'adminNotFound',
+        redirect: (to) => `/t/${String(to.params.tenantCode)}/home`,
+      },
+]
+
+const routes: RouteRecordRaw[] = [
+  { path: '/login', name: 'login', component: () => import('@/pages/LoginPage.vue'), meta: { public: true, title: () => i18n.global.t('menu.login') } },
+  { path: '/t/:tenantCode/login', name: 'tenant-login', component: () => import('@/pages/LoginPage.vue'), meta: { public: true, title: () => i18n.global.t('menu.login') } },
+  { path: '/join', name: 'join', component: () => import('@/pages/JoinPage.vue'), meta: { public: true, title: () => i18n.global.t('menu.join') } },
+  { path: '/t/:tenantCode/join', name: 'tenant-join', component: () => import('@/pages/JoinPage.vue'), meta: { public: true, title: () => i18n.global.t('menu.join') } },
+  {
+    path: '/platform/login',
+    name: 'platform-login',
+    component: () => import('@/pages/platform/PlatformLoginPage.vue'),
+    meta: { public: true },
+  },
+  {
+    path: '/platform',
+    component: () => import('@/layouts/PlatformLayout.vue'),
+    meta: { platform: true },
+    children: [
+      { path: '', redirect: '/platform/tenants' },
+      { path: 'tenants', component: () => import('@/pages/platform/PlatformTenantsPage.vue') },
+      { path: 'packages', component: () => import('@/pages/platform/PlatformPackagesPage.vue') },
+      { path: 'subscription-orders', component: () => import('@/pages/platform/PlatformSubscriptionOrdersPage.vue') },
+      { path: 'settings', component: () => import('@/pages/platform/PlatformSettingsPage.vue') },
+      { path: 'ai-models', component: () => import('@/pages/platform/PlatformAiModelsPage.vue'), meta: { title: () => i18n.global.t('menu.aiModel') } },
+      { path: 'profile', component: () => import('@/pages/platform/PlatformProfilePage.vue'), meta: { title: () => i18n.global.t('menu.profile') } },
+    ],
+  },
+  {
+    path: '/t/:tenantCode',
+    component: () => import('@/layouts/AppLayout.vue'),
+    redirect: (to) => `/t/${String(to.params.tenantCode)}/home`,
+    children: appChildren,
+  },
+  {
+    path: '/',
+    redirect: () => {
+      const code = getStoredTenantCode()
+      return code ? `/t/${code}/home` : '/login'
+    },
+  },
+]
+
+const router = createRouter({ history: createWebHistory(), routes })
+
+router.beforeEach(async (to) => {
+  const pathTenant =
+    parseTenantFromPath(to.path) ||
+    (typeof to.params.tenantCode === 'string' ? to.params.tenantCode.toUpperCase() : null)
+
+  if (to.meta.platform) {
+    if (to.meta.public) return true
+    if (!getPlatformToken()) return { path: '/platform/login' }
+    return true
+  }
+
+  const auth = useAuthStore()
+  const isPublic = Boolean(to.meta.public)
+  if (isPublic) {
+    if (pathTenant) setStoredTenantCode(pathTenant)
+    return true
+  }
+
+  const loginPath = pathTenant ? `/t/${pathTenant}/login` : '/login'
+  if (!auth.token) {
+    if (pathTenant) setStoredTenantCode(pathTenant)
+    return { path: loginPath, query: { redirect: to.fullPath } }
+  }
+
+  if (!auth.me) {
+    try {
+      await auth.fetchMe()
+    } catch {
+      auth.logout()
+      return { path: loginPath, query: { redirect: to.fullPath } }
+    }
+  }
+
+  const sessionTenant = (auth.me?.tenant_code || getStoredTenantCode() || pathTenant || '').trim().toUpperCase()
+  if (sessionTenant) setStoredTenantCode(sessionTenant)
+
+  // URL 租户与当前登录租户不一致时，纠正到当前租户（避免切企业后仍进旧 /t/GONGXING/）
+  if (pathTenant && sessionTenant && pathTenant !== sessionTenant) {
+    const sub = to.path.replace(/^\/t\/[^/]+/i, '') || '/home'
+    return `/t/${encodeURIComponent(sessionTenant)}${sub.startsWith('/') ? sub : `/${sub}`}`
+  }
+
+  // 旧链接 /home → /t/{当前租户}/home
+  if (!parseTenantFromPath(to.path) && sessionTenant) {
+    return tenantAdminPath(to.path, sessionTenant)
+  }
+
+  const h5Kind = auth.me ? getH5PortalKind(auth.me) : null
+  if (h5Kind) {
+    const tc = (sessionTenant || pathTenant || '').trim()
+    if (tc && (await redirectToH5Portal(tc, h5Kind))) {
+      auth.logout()
+      return false
+    }
+    auth.logout()
+    ElMessage.warning('员工/客户请使用手机端 H5；若无法跳转，请联系管理员配置 H5 站点地址')
+    return { path: loginPath }
+  }
+
+  const need = to.meta.permissions as string[] | undefined
+  const optional = new Set(['dashboard.view'])
+  const required = need?.filter((x) => !optional.has(x))
+  if (required && required.length > 0 && !auth.hasAnyPermission(required)) {
+    ElMessage.error('无权限访问')
+    return tenantAdminPath('/home', sessionTenant || getStoredTenantCode())
+  }
+  return true
+})
+
+router.onError((error) => {
+  tryRecoverStaleChunk(error)
+})
+
+export default router
